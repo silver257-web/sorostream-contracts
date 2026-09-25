@@ -1073,6 +1073,7 @@ impl SoroStreamContract {
         if amount <= 0 {
             return Err(StreamError::ZeroAmount);
         }
+        validate_recipient_address(&env, &sender, &recipient)?;
 
         // Recipient whitelist check
         if is_whitelist_enabled(&env) && !is_whitelisted(&env, &recipient) {
@@ -1539,6 +1540,7 @@ impl SoroStreamContract {
         if amount <= 0 {
             return Err(StreamError::ZeroAmount);
         }
+        validate_recipient_address(&env, &sender, &recipient)?;
         if cliff_seconds > duration_seconds {
             return Err(StreamError::InvalidCliff);
         }
@@ -1715,6 +1717,7 @@ impl SoroStreamContract {
         if deposit <= 0 {
             return Err(StreamError::ZeroAmount);
         }
+        validate_recipient_address(&env, &sender, &recipient)?;
         if milestones_data.is_empty() {
             return Err(StreamError::InvalidDuration);
         }
