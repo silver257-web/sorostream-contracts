@@ -227,6 +227,19 @@ pub fn recipient_transferred(
     );
 }
 
+/// Emitted when a stream sender transfers ownership to a new sender.
+pub fn sender_transferred(
+    env: &Env,
+    stream_id: u64,
+    old_sender: &Address,
+    new_sender: &Address,
+) {
+    env.events().publish(
+        (Symbol::new(env, "SenderTransferred"), stream_id),
+        (old_sender.clone(), new_sender.clone()),
+    );
+}
+
 /// Emitted when a migration is successfully applied.
 pub fn contract_migrated(env: &Env, from_version: &String, to_version: &String, admin: &Address) {
     env.events().publish(

@@ -58,7 +58,7 @@ use storage::{
     is_blocked, is_fee_exempt, is_paused_or_auto_unpause, is_recipient_allowed,
     is_rate_limit_exempt, is_reentrancy_locked, is_sender_promoted,
     is_token_whitelisted, is_token_whitelist_enabled, is_whitelisted,
-    is_whitelist_enabled, load_stream, load_tranches,
+    is_whitelist_enabled, load_stream, load_tranches, stream_exists,
     add_token_to_whitelist, set_token_whitelist_enabled,
     mark_nonce_used, MAX_PAUSE_DURATION, nonce_used,
     read_admin, read_applied_migrations, read_audit_log,
@@ -1051,7 +1051,7 @@ impl SoroStreamContract {
 
         // Validate start_time: must be >= now
         if start_time < now {
-            return Err(StreamError::StartTimeTooFar);
+            return Err(StreamError::InvalidStartTime);
         }
 
         // Validate start_time is not too far in the future
@@ -3704,6 +3704,194 @@ impl SoroStreamContract {
         Ok(())
     }
 
+    pub fn split_stream_with_schedules(
+        env: Env,
+        stream_id: u64,
+        sender: Address,
+        recipients: Vec<Address>,
+        amounts: Vec<i128>,
+        flow_rates: Vec<i128>,
+        end_times: Vec<u64>,
+        nonce: u64,
+    ) -> Result<Vec<u64>, StreamError> {
+        if is_paused_or_auto_unpause(&env) {
+            return Err(StreamError::ContractPaused);
+        }
+        if is_reentrancy_locked(&env) {
+            return Err(StreamError::ReentrancyDetected);
+        }
+        if recipients.len() != 2 || amounts.len() != 2 || flow_rates.len() != 2 || end_times.len() != 2 {
+            return Err(StreamError::BatchLengthMismatch);
+        }
+
+        sender.require_auth();
+        let stream = load_stream(&env, stream_id).ok_or(StreamError::StreamNotFound)?;
+        if stream.sender != sender {
+            return Err(StreamError::NotSender);
+        }
+        if stream.status != StreamStatus::Active {
+            return Err(StreamError::StreamNotActive);
+        }
+        if stream.options.sender_locked {
+            return Err(StreamError::StreamIsLocked);
+        }
+
+        let now = env.ledger().timestamp();
+        let claimable = if now < stream.cliff_time {
+            0
+        } else {
+            let earned = vesting_math::compute_earned(
+                stream.flow_rate,
+                now,
+                stream.end_time,
+                stream.last_withdraw_time,
+            )
+            .ok_or(StreamError::Overflow)?;
+            let available = stream.deposit.saturating_sub(stream.options.total_withdrawn);
+            earned.min(available)
+        };
+
+        let mut total_amount = 0i128;
+        for i in 0..2u32 {
+            let amount = amounts.get_unchecked(i);
+            let flow_rate = flow_rates.get_unchecked(i);
+            let end_time = end_times.get_unchecked(i);
+            if amount <= 0 || flow_rate <= 0 || end_time <= now {
+                return Err(StreamError::InvalidDuration);
+            }
+            let duration = end_time - now;
+            let expected_amount = flow_rate
+                .checked_mul(duration as i128)
+                .ok_or(StreamError::Overflow)?;
+            if expected_amount != amount {
+                return Err(StreamError::InvalidEndTime);
+            }
+            total_amount = total_amount.checked_add(amount).ok_or(StreamError::Overflow)?;
+        }
+        if total_amount != claimable {
+            return Err(StreamError::InvalidDuration);
+        }
+
+        set_reentrancy_lock(&env);
+        let refund_amount = stream
+            .deposit
+            .saturating_sub(stream.options.total_withdrawn)
+            .saturating_sub(claimable);
+        let holdback_refund = if !stream.options.holdback_claimed && stream.options.holdback_amount > 0 {
+            get_holdback(&env, stream_id)
+        } else {
+            0
+        };
+
+        remove_stream(&env, stream_id);
+        Self::unindex_stream(&env, &stream, stream_id);
+        if holdback_refund > 0 {
+            remove_holdback(&env, stream_id);
+        }
+        decrement_active_stream_count(&env);
+        decrement_token_stream_count(&env, &stream.token);
+
+        let token_client = token::Client::new(&env, &stream.token);
+        let total_refund = refund_amount.saturating_add(holdback_refund);
+        if total_refund > 0 {
+            token_client.transfer(
+                &env.current_contract_address(),
+                &stream.sender,
+                &total_refund,
+            );
+        }
+
+        let mut child_ids = Vec::new(&env);
+        for i in 0..2u32 {
+            let recipient = recipients.get_unchecked(i);
+            let amount = amounts.get_unchecked(i);
+            let flow_rate = flow_rates.get_unchecked(i);
+            let end_time = end_times.get_unchecked(i);
+            let mut child_id = derive_stream_id(&env, &sender, &recipient, now, nonce ^ i as u64);
+            if stream_exists(&env, child_id) {
+                let mut found = false;
+                for retry in 1u64..=3 {
+                    let candidate = derive_stream_id(
+                        &env,
+                        &sender,
+                        &recipient,
+                        now,
+                        (nonce ^ i as u64) ^ (retry << 32),
+                    );
+                    if !stream_exists(&env, candidate) {
+                        child_id = candidate;
+                        found = true;
+                        break;
+                    }
+                }
+                if !found {
+                    return Err(StreamError::IDCollision);
+                }
+            }
+
+            let mut options = stream.options.clone();
+            options.renewals_used = 0;
+            options.last_pause_time = 0;
+            options.total_withdrawn = 0;
+            options.locked = false;
+            options.milestones = Vec::new(&env);
+            options.milestone_release_mode = false;
+            options.holdback_amount = 0;
+            options.holdback_claimed = false;
+            options.is_step_vesting = false;
+            options.tranches_claimed = 0;
+            options.curve = VestingCurve::Linear;
+            options.withdrawal_steps = None;
+            options.current_step = 0;
+            options.requires_recipient_approval = false;
+            options.approval_timestamp = 0;
+            options.sender_locked = false;
+            options.redirect_to_stream_id = None;
+            options.on_complete_contract = None;
+            options.on_complete_function = None;
+
+            let child = Stream {
+                id: child_id,
+                sender: sender.clone(),
+                recipient: recipient.clone(),
+                token: stream.token.clone(),
+                deposit: amount,
+                flow_rate,
+                start_time: now,
+                cliff_time: now,
+                lock_until: now,
+                end_time,
+                last_withdraw_time: now,
+                status: StreamStatus::Active,
+                auto_renew: false,
+                options,
+            };
+
+            save_stream(&env, &child);
+            index_by_sender(&env, &sender, child_id);
+            index_by_recipient(&env, &recipient, child_id);
+            index_global_stream(&env, child_id);
+            increment_active_stream_count(&env);
+            increment_token_stream_count(&env, &child.token);
+            events::stream_created(
+                &env,
+                child_id,
+                &sender,
+                &recipient,
+                amount,
+                flow_rate,
+                end_time,
+                false,
+                &None,
+            );
+            child_ids.push_back(child_id);
+        }
+
+        extend_instance_ttl(&env);
+        clear_reentrancy_lock(&env);
+        Ok(child_ids)
+    }
+
     /// Splits a stream by canceling it and atomically creating multiple new streams
     /// with proportionally split balances among new recipients.
     ///
@@ -3892,6 +4080,45 @@ impl SoroStreamContract {
 
         clear_reentrancy_lock(&env);
         Ok(new_stream_ids)
+    }
+
+    /// Transfers claim rights of a stream to a new recipient.
+    pub fn transfer_sender(
+        env: Env,
+        stream_id: u64,
+        current_sender: Address,
+        new_sender: Address,
+    ) -> Result<(), StreamError> {
+        if is_paused_or_auto_unpause(&env) {
+            return Err(StreamError::ContractPaused);
+        }
+        current_sender.require_auth();
+
+        let mut stream = load_stream(&env, stream_id).ok_or(StreamError::StreamNotFound)?;
+        if stream.sender != current_sender {
+            return Err(StreamError::NotSender);
+        }
+        if stream.status != StreamStatus::Active
+            && stream.status != StreamStatus::Paused
+            && stream.status != StreamStatus::PendingApproval
+            && stream.status != StreamStatus::EscrowHold
+        {
+            return Err(StreamError::StreamNotActive);
+        }
+        if stream.options.sender_locked {
+            return Err(StreamError::StreamLocked);
+        }
+
+        let old_sender = stream.sender.clone();
+        stream.sender = new_sender.clone();
+        save_stream(&env, &stream);
+
+        unindex_by_sender(&env, &old_sender, stream_id);
+        index_by_sender(&env, &new_sender, stream_id);
+        remove_delegate(&env, stream_id);
+
+        events::sender_transferred(&env, stream_id, &old_sender, &new_sender);
+        Ok(())
     }
 
     /// Transfers claim rights of a stream to a new recipient.
@@ -5254,6 +5481,18 @@ impl SoroStreamContract {
             return Err(StreamError::ContractPaused);
         }
         recipient.require_auth();
+
+        let invoker = env.invoker();
+        if recipient != invoker {
+            return Err(StreamError::NotRecipient);
+        }
+
+        for stream_id in stream_ids.iter() {
+            let stream = load_stream(&env, stream_id).ok_or(StreamError::StreamNotFound)?;
+            if stream.recipient != invoker {
+                return Err(StreamError::NotRecipient);
+            }
+        }
 
         let mut amounts = Vec::new(&env);
 

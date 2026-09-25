@@ -1204,9 +1204,6 @@ fn snapshot_event_auto_renew_failed() {
 //   - InsufficientBalance (7): No code path returns this error. It exists as
 //     a placeholder for future balance-check logic. The contract relies on
 //     token::Client::transfer to panic on insufficient balance instead.
-//   - InvalidStartTime (12): No code path returns this error. Stream start
-//     times are always set to env.ledger().timestamp(), never user-supplied.
-
 #[test]
 fn error_stream_not_found() {
     let t = setup();
@@ -1889,6 +1886,39 @@ fn error_not_recipient_in_batch_withdraw() {
 }
 
 #[test]
+fn batch_withdraw_rejects_mixed_recipients_before_processing() {
+    let t = setup();
+    let c = client(&t);
+    let other_recipient = Address::generate(&t.env);
+
+    let first_stream_id = c.create_stream(
+        &t.sender, &t.recipient, &t.token_id, &100_000, &1000, &0, &0u64, &false, &0u64,
+        &false,
+        &0i128,
+        &None::<u32>,
+        &None::<i128>,
+        &None::<u32>,
+    );
+    let second_stream_id = c.create_stream(
+        &t.sender, &other_recipient, &t.token_id, &100_000, &1000, &0, &0u64, &false, &0u64,
+        &false,
+        &0i128,
+        &None::<u32>,
+        &None::<i128>,
+        &None::<u32>,
+    );
+
+    t.env.ledger().set_timestamp(500);
+    let result = c.try_batch_withdraw(
+        &soroban_vec![&t.env, first_stream_id, second_stream_id],
+        &t.recipient,
+    );
+
+    assert_eq!(result, Err(Ok(StreamError::NotRecipient)));
+    assert_eq!(c.get_stream(&first_stream_id).options.total_withdrawn, 0);
+}
+
+#[test]
 fn error_invalid_duration_fee_too_high() {
     let t = setup();
     let c = client(&t);
@@ -1902,11 +1932,6 @@ fn error_invalid_duration_fee_too_high() {
 //   token::Client::transfer on insufficient balance. No contract code path
 //   returns this variant. Kept for potential future use with explicit
 //   balance checks.
-// - InvalidStartTime (12): Never returned. Stream start times are always
-//   set to env.ledger().timestamp(), not user-supplied. No code path
-//   returns this variant. Kept for potential future use with scheduled
-//   stream starts.
-
 #[test]
 fn test_top_up_amount_overflow() {
     let t = setup();
@@ -5159,6 +5184,61 @@ fn test_transfer_recipient_succeeds_when_flag_is_false() {
 }
 
 #[test]
+fn test_transfer_sender_moves_management_and_sender_index() {
+    let t = setup();
+    let c = client(&t);
+    let new_sender = Address::generate(&t.env);
+    let delegate = Address::generate(&t.env);
+
+    let stream_id = c.create_stream(
+        &t.sender, &t.recipient, &t.token_id,
+        &100_000i128, &1000u64, &0u64, &0u64,
+        &false, &0u64, &false, &0i128,
+        &None::<u32>, &None::<i128>, &false,
+    );
+    c.set_delegate(&t.sender, &stream_id, &delegate);
+    c.transfer_sender(&stream_id, &t.sender, &new_sender);
+
+    let stream = c.get_stream(&stream_id);
+    assert_eq!(stream.sender, new_sender);
+    assert_eq!(stream.recipient, t.recipient);
+    assert!(c.get_streams_by_sender(&t.sender, &0u32, &20u32).is_empty());
+    assert_eq!(c.get_streams_by_sender(&new_sender, &0u32, &20u32).len(), 1);
+
+    let old_sender_result = c.try_cancel_stream(&stream_id, &t.sender);
+    assert_eq!(old_sender_result, Err(Ok(StreamError::NotAuthorized)));
+    let old_delegate_result = c.try_cancel_stream(&stream_id, &delegate);
+    assert_eq!(old_delegate_result, Err(Ok(StreamError::NotAuthorized)));
+
+    c.pause_stream(&stream_id, &new_sender);
+    c.resume_stream(&stream_id, &new_sender);
+    c.cancel_stream(&stream_id, &new_sender);
+    assert!(c.try_get_stream(&stream_id).is_err());
+}
+
+#[test]
+fn test_transfer_sender_rejects_wrong_sender_and_locked_stream() {
+    let t = setup();
+    let c = client(&t);
+    let impostor = Address::generate(&t.env);
+    let new_sender = Address::generate(&t.env);
+    let stream_id = c.create_stream(
+        &t.sender, &t.recipient, &t.token_id,
+        &100_000i128, &1000u64, &0u64, &0u64,
+        &false, &0u64, &false, &0i128,
+        &None::<u32>, &None::<i128>, &false,
+    );
+
+    let wrong_sender_result = c.try_transfer_sender(&stream_id, &impostor, &new_sender);
+    assert_eq!(wrong_sender_result, Err(Ok(StreamError::NotSender)));
+
+    c.lock_stream(&stream_id, &t.sender);
+    let locked_result = c.try_transfer_sender(&stream_id, &t.sender, &new_sender);
+    assert_eq!(locked_result, Err(Ok(StreamError::StreamLocked)));
+    assert_eq!(c.get_stream(&stream_id).sender, t.sender);
+}
+
+#[test]
 fn test_non_transferable_stream_can_be_cancelled_by_sender() {
     let t = setup();
     let c = client(&t);
@@ -6535,6 +6615,34 @@ fn test_get_claimable_future_start_time_zero_at_creation() {
 }
 
 #[test]
+fn test_scheduled_stream_rejects_past_start_time() {
+    let t = setup();
+    let c = client(&t);
+    t.env.ledger().set_timestamp(100);
+
+    let result = c.try_create_stream_scheduled(
+        &t.sender,
+        &t.recipient,
+        &t.token_id,
+        &100_000i128,
+        &1000u64,
+        &99u64,
+        &0u64,
+        &0u64,
+        &false,
+        &None::<u32>,
+        &0u64,
+        &false,
+        &0i128,
+        &None::<Address>,
+        &None::<soroban_sdk::Symbol>,
+        &false,
+    );
+
+    assert_eq!(result, Err(Ok(StreamError::InvalidStartTime)));
+}
+
+#[test]
 fn test_get_claimable_cliff_before_start_prevents_premature_withdrawal() {
     // This test verifies that cliff_time enforcement prevents withdrawals
     // before tokens begin to accrue. This is a key protection for future-start streams
@@ -7753,6 +7861,94 @@ fn test_split_stream_closes_parent_stream() {
     assert_eq!(child_stream2.status, StreamStatus::Active);
     assert_eq!(child_stream1.deposit, 500_000);
     assert_eq!(child_stream2.deposit, 500_000);
+}
+
+#[test]
+fn test_split_stream_with_schedules_uses_current_claimable_balance() {
+    let t = setup();
+    let c = client(&t);
+    t.env.ledger().set_timestamp(0);
+
+    let stream_id = c.create_stream(
+        &t.sender,
+        &t.recipient,
+        &t.token_id,
+        &1_000_000,
+        &1000,
+        &0,
+        &0u64,
+        &false,
+        &0u64,
+        &false,
+        &0i128,
+        &None::<u32>,
+        &None::<i128>,
+        &None::<u32>,
+    );
+    let recipient1 = Address::generate(&t.env);
+    let recipient2 = Address::generate(&t.env);
+    t.env.ledger().set_timestamp(500);
+
+    let child_ids = c.split_stream_with_schedules(
+        &stream_id,
+        &t.sender,
+        &soroban_vec![&t.env, recipient1.clone(), recipient2.clone()],
+        &soroban_vec![&t.env, 200_000i128, 300_000i128],
+        &soroban_vec![&t.env, 100i128, 300i128],
+        &soroban_vec![&t.env, 2_500u64, 1_500u64],
+        &7u64,
+    );
+
+    assert_eq!(child_ids.len(), 2);
+    assert!(c.try_get_stream(&stream_id).is_err());
+    let child1 = c.get_stream(&child_ids.get_unchecked(0));
+    let child2 = c.get_stream(&child_ids.get_unchecked(1));
+    assert_eq!(child1.recipient, recipient1);
+    assert_eq!(child1.deposit, 200_000);
+    assert_eq!(child1.flow_rate, 100);
+    assert_eq!(child1.end_time, 2_500);
+    assert_eq!(child2.recipient, recipient2);
+    assert_eq!(child2.deposit, 300_000);
+    assert_eq!(child2.flow_rate, 300);
+    assert_eq!(child2.end_time, 1_500);
+}
+
+#[test]
+fn test_split_stream_with_schedules_rejects_non_claimable_allocation() {
+    let t = setup();
+    let c = client(&t);
+    let stream_id = c.create_stream(
+        &t.sender,
+        &t.recipient,
+        &t.token_id,
+        &1_000_000,
+        &1000,
+        &0,
+        &0u64,
+        &false,
+        &0u64,
+        &false,
+        &0i128,
+        &None::<u32>,
+        &None::<i128>,
+        &None::<u32>,
+    );
+    let recipient1 = Address::generate(&t.env);
+    let recipient2 = Address::generate(&t.env);
+    t.env.ledger().set_timestamp(500);
+
+    let result = c.try_split_stream_with_schedules(
+        &stream_id,
+        &t.sender,
+        &soroban_vec![&t.env, recipient1, recipient2],
+        &soroban_vec![&t.env, 250_000i128, 300_000i128],
+        &soroban_vec![&t.env, 125i128, 300i128],
+        &soroban_vec![&t.env, 2_500u64, 1_500u64],
+        &7u64,
+    );
+
+    assert_eq!(result, Err(Ok(StreamError::InvalidDuration)));
+    assert!(c.try_get_stream(&stream_id).is_ok());
 }
 
 // Issue #490: getStream returns Completed status when stream deposit is fully exhausted
