@@ -1089,6 +1089,10 @@ impl SoroStreamContract {
             return Err(StreamError::StreamDurationTooShort);
         }
 
+        if duration_seconds == 0 {
+            return Err(StreamError::InvalidDuration);
+        }
+
         let max_dur = read_max_duration(&env);
         if max_dur > 0 && duration_seconds > max_dur {
             return Err(StreamError::DurationExceedsMax);
@@ -1549,6 +1553,10 @@ impl SoroStreamContract {
         let min_dur = read_min_duration(&env);
         if duration_seconds < min_dur {
             return Err(StreamError::StreamDurationTooShort);
+        }
+
+        if duration_seconds == 0 {
+            return Err(StreamError::InvalidDuration);
         }
 
         // For linear streams the flow_rate is used; for TimeDecay it is stored
@@ -2506,6 +2514,10 @@ impl SoroStreamContract {
             return Err(StreamError::StreamLocked);
         }
 
+        if stream.end_time <= stream.start_time {
+            return Err(StreamError::InvalidEndTime);
+        }
+
         let cooldown = get_withdrawal_cooldown(&env);
         if cooldown > 0 && now < stream.last_withdraw_time.saturating_add(cooldown) {
             return Err(StreamError::WithdrawalCooldownActive);
@@ -2635,6 +2647,10 @@ impl SoroStreamContract {
             }
 
             let tranches_newly_claimed = new_cursor - stream.options.tranches_claimed;
+
+            if claimable == 0 {
+                return Ok(());
+            }
 
             // Compute fee on claimable amount.
             let (recipient_amount, fee_amount, treasury_opt) = if claimable > 0 {
@@ -5280,6 +5296,11 @@ impl SoroStreamContract {
 
             let available = stream.deposit.saturating_sub(stream.options.total_withdrawn);
             let claimable = raw_claimable.min(available);
+
+            if claimable == 0 {
+                amounts.push_back(0);
+                continue;
+            }
 
             let (recipient_amount, fee_amount) = if claimable > 0 {
                 let fee_bps = get_protocol_fee(&env);
