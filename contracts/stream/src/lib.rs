@@ -217,6 +217,10 @@ fn refreshed_stream_view(env: &Env, mut stream: Stream) -> Stream {
     stream
 }
 
+fn stream_refund_recipient(stream: &Stream) -> Address {
+    stream.sponsor.clone().unwrap_or_else(|| stream.sender.clone())
+}
+
 // ── Feature (a): maybe emit StreamExpiryWarning ───────────────────────────────
 #[allow(dead_code)]
 fn maybe_emit_expiry_warning(env: &Env, stream: &mut Stream) {
@@ -680,6 +684,14 @@ impl SoroStreamContract {
         auto_renew: bool,
         params: crate::types::CreateStreamParams,
     ) -> Result<u64, StreamError> {
+        let payer = params.sponsor.clone().unwrap_or_else(|| sender.clone());
+        if payer != sender {
+            sender.require_auth();
+            payer.require_auth();
+        } else {
+            sender.require_auth();
+        }
+
         let nonce = params.nonce;
         let cliff_seconds = params.cliff_seconds;
         let lock_until = params.lock_until;
@@ -689,7 +701,6 @@ impl SoroStreamContract {
         let on_complete_contract: Option<Address> = None;
         let on_complete_function: Option<Symbol> = None;
         let enforce_recipient_allowlist = false;
-        sender.require_auth();
 
         if is_paused_or_auto_unpause(&env) {
             return Err(StreamError::ContractPaused);
@@ -874,9 +885,9 @@ impl SoroStreamContract {
             events::creation_fee_collected(&env, creation_fee, &treasury);
         }
 
-        // Transfer total amount (streaming + holdback) from sender into contract escrow.
+        // Transfer total amount (streaming + holdback) from the funding sponsor into contract escrow.
         token::Client::new(&env, &token).transfer(
-            &sender,
+            &payer,
             &env.current_contract_address(),
             &amount,
         );
@@ -884,6 +895,7 @@ impl SoroStreamContract {
         let stream = Stream {
             id: stream_id,
             sender: sender.clone(),
+            sponsor: params.sponsor.clone(),
             recipient: recipient.clone(),
             token: token.clone(),
             deposit: streaming_amount,
@@ -973,6 +985,23 @@ impl SoroStreamContract {
         Ok(stream_id)
     }
 
+    /// Creates a new payment stream where a distinct address funds the escrow but the sender remains the stream controller.
+    pub fn create_stream_with_sponsor(
+        env: Env,
+        sender: Address,
+        recipient: Address,
+        token: Address,
+        amount: i128,
+        duration_seconds: u64,
+        auto_renew: bool,
+        sponsor: Address,
+        params: crate::types::CreateStreamParams,
+    ) -> Result<u64, StreamError> {
+        let mut params = params;
+        params.sponsor = Some(sponsor.clone());
+        Self::create_stream(env, sender, recipient, token, amount, duration_seconds, auto_renew, params)
+    }
+
     /// Creates a new payment stream using a federation name (Issue #238).
     #[allow(dead_code)]
     fn create_stream_with_federation(
@@ -1011,6 +1040,7 @@ impl SoroStreamContract {
                 holdback_amount: 0,
                 withdrawal_steps: None,
                 min_withdrawal_amount: None,
+                sponsor: None,
                 requires_recipient_approval: false,
             },
         )
@@ -1174,6 +1204,7 @@ impl SoroStreamContract {
         let stream = Stream {
             id: stream_id,
             sender: sender.clone(),
+            sponsor: None,
             recipient: recipient.clone(),
             token: token.clone(),
             deposit: streaming_amount,
@@ -1429,6 +1460,7 @@ impl SoroStreamContract {
         let stream = Stream {
             id: stream_id,
             sender: sender.clone(),
+            sponsor: None,
             recipient: recipient.clone(),
             token: token.clone(),
             deposit,
@@ -1620,6 +1652,7 @@ impl SoroStreamContract {
         let stream = Stream {
             id: stream_id,
             sender: sender.clone(),
+            sponsor: None,
             recipient: recipient.clone(),
             token: token.clone(),
             deposit: amount,
@@ -1811,6 +1844,7 @@ impl SoroStreamContract {
         let stream = Stream {
             id: stream_id,
             sender: sender.clone(),
+            sponsor: None,
             recipient: recipient.clone(),
             token: token.clone(),
             deposit,
@@ -3881,6 +3915,7 @@ impl SoroStreamContract {
                     holdback_amount: 0,
                     withdrawal_steps: None,
                     min_withdrawal_amount: None,
+                    sponsor: None,
                     requires_recipient_approval: false,
                 },
             )?;
@@ -4125,7 +4160,8 @@ impl SoroStreamContract {
         if earned > 0 {
             token_client.transfer(&env.current_contract_address(), &stream.recipient, &earned);
         }
-        token_client.transfer(&env.current_contract_address(), &stream.sender, &cancel_amount);
+        let refund_recipient = stream_refund_recipient(&stream);
+        token_client.transfer(&env.current_contract_address(), &refund_recipient, &cancel_amount);
 
         stream.status = StreamStatus::Cancelled;
         save_stream(&env, &stream);
@@ -4140,6 +4176,7 @@ impl SoroStreamContract {
         let new_stream = Stream {
             id: new_stream_id,
             sender: stream.sender.clone(),
+            sponsor: stream.sponsor.clone(),
             recipient: stream.recipient.clone(),
             token: stream.token.clone(),
             deposit: new_deposit,
@@ -4501,6 +4538,51 @@ impl SoroStreamContract {
         );
 
         events::holdback_clawed_back(&env, stream_id, escrow, &stream.sender);
+        Ok(())
+    }
+
+    /// Clawbacks the outstanding escrow for a stream on behalf of the token issuer.
+    ///
+    /// This is intended for tokens with issuer-managed clawback enforcement (for
+    /// example, certain USDC jurisdictions), where the issuer may reclaim the
+    /// contract's remaining stream balance and permanently burn it. After the
+    /// token-side clawback succeeds, the stream is removed from protocol storage
+    /// and no further token flow can occur.
+    pub fn clawback_stream(env: Env, stream_id: u64, issuer: Address) -> Result<(), StreamError> {
+        issuer.require_auth();
+
+        let stream = load_stream(&env, stream_id).ok_or(StreamError::StreamNotFound)?;
+        let token_client = token::StellarAssetClient::new(&env, &stream.token);
+        if token_client.admin() != issuer {
+            return Err(StreamError::NotAuthorized);
+        }
+
+        let holdback_escrow = if !stream.options.holdback_claimed && stream.options.holdback_amount > 0 {
+            get_holdback(&env, stream_id)
+        } else {
+            0
+        };
+        let reclaimable = stream
+            .deposit
+            .saturating_sub(stream.options.total_withdrawn)
+            .saturating_add(holdback_escrow);
+
+        if reclaimable > 0 {
+            token_client.clawback(&env.current_contract_address(), &reclaimable);
+        }
+
+        if stream.status == StreamStatus::Active {
+            decrement_active_stream_count(&env);
+            decrement_token_stream_count(&env, &stream.token);
+        }
+
+        if holdback_escrow > 0 {
+            remove_holdback(&env, stream_id);
+        }
+        remove_stream(&env, stream_id);
+        Self::unindex_stream(&env, &stream, stream_id);
+
+        events::stream_clawed_back(&env, stream_id, &stream.sender, &stream.recipient, reclaimable, &issuer);
         Ok(())
     }
 
@@ -5168,6 +5250,7 @@ impl SoroStreamContract {
             let stream = Stream {
                 id: stream_id,
                 sender: sender.clone(),
+                sponsor: None,
                 recipient: recipient.clone(),
                 token: token.clone(),
                 deposit: amount,
@@ -5437,61 +5520,68 @@ impl SoroStreamContract {
             return Err(StreamError::BatchLengthMismatch);
         }
 
+        // Phase 1: validate the entire batch before mutating any stream.
+        // This enforces the all-or-nothing semantics expected for bulk cancellation.
+        let mut validated_ids = Vec::new(&env);
+        for stream_id in stream_ids.iter() {
+            for i in 0..validated_ids.len() {
+                if validated_ids.get_unchecked(i) == stream_id {
+                    return Err(StreamError::DuplicateStream);
+                }
+            }
+
+            let stream = load_stream(&env, stream_id).ok_or(StreamError::StreamNotFound)?;
+            if stream.sender != sender {
+                return Err(StreamError::NotSender);
+            }
+            if stream.status != StreamStatus::Active && stream.status != StreamStatus::Paused {
+                return Err(StreamError::StreamNotActive);
+            }
+            validated_ids.push_back(stream_id);
+        }
+
         let mut results = Vec::new(&env);
 
-        for stream_id in stream_ids.iter() {
-            let result = (|| {
-                let stream = load_stream(&env, stream_id).ok_or(StreamError::StreamNotFound)?;
+        // Phase 2: execute cancellations only after every stream has passed validation.
+        for stream_id in validated_ids.iter() {
+            let stream = load_stream(&env, stream_id).ok_or(StreamError::StreamNotFound)?;
 
-                if stream.sender != sender {
-                    return Err(StreamError::NotSender);
-                }
+            let now = env.ledger().timestamp();
+            let recipient_amount = vesting_math::compute_earned(
+                stream.flow_rate, now, stream.end_time, stream.last_withdraw_time,
+            ).ok_or(StreamError::Overflow)?;
 
-                if stream.status != StreamStatus::Active && stream.status != StreamStatus::Paused {
-                    return Err(StreamError::StreamNotActive);
-                }
+            let available = stream.deposit.saturating_sub(stream.options.total_withdrawn);
+            let recipient_amount = recipient_amount.min(available);
+            let refund_amount = available.saturating_sub(recipient_amount);
 
-                let now = env.ledger().timestamp();
-                let recipient_amount = vesting_math::compute_earned(
-                    stream.flow_rate, now, stream.end_time, stream.last_withdraw_time,
-                ).ok_or(StreamError::Overflow)?;
+            if stream.status == StreamStatus::Active {
+                decrement_active_stream_count(&env);
+                decrement_token_stream_count(&env, &stream.token);
+            }
 
-                let available = stream.deposit.saturating_sub(stream.options.total_withdrawn);
-                let recipient_amount = recipient_amount.min(available);
-                let refund_amount = available.saturating_sub(recipient_amount);
+            remove_stream(&env, stream_id);
+            unindex_by_sender(&env, &stream.sender, stream_id);
+            unindex_by_recipient(&env, &stream.recipient, stream_id);
 
-                // Decrement active count only if stream was Active (Paused was already decremented)
-                if stream.status == StreamStatus::Active {
-                    decrement_active_stream_count(&env);
-                    decrement_token_stream_count(&env, &stream.token);
-                }
+            let token_client = token::Client::new(&env, &stream.token);
+            if recipient_amount > 0 {
+                token_client.transfer(
+                    &env.current_contract_address(),
+                    &stream.recipient,
+                    &recipient_amount,
+                );
+            }
+            if refund_amount > 0 {
+                token_client.transfer(
+                    &env.current_contract_address(),
+                    &stream.sender,
+                    &refund_amount,
+                );
+            }
 
-                // EFFECTS
-                remove_stream(&env, stream_id);
-                unindex_by_sender(&env, &stream.sender, stream_id);
-                unindex_by_recipient(&env, &stream.recipient, stream_id);
-
-                // INTERACTIONS
-                let token_client = token::Client::new(&env, &stream.token);
-                if recipient_amount > 0 {
-                    token_client.transfer(
-                        &env.current_contract_address(),
-                        &stream.recipient,
-                        &recipient_amount,
-                    );
-                }
-                if refund_amount > 0 {
-                    token_client.transfer(
-                        &env.current_contract_address(),
-                        &stream.sender,
-                        &refund_amount,
-                    );
-                }
-
-                events::stream_cancelled(&env, stream_id, &stream.sender, refund_amount, recipient_amount);
-                Ok(())
-            })();
-            results.push_back(result);
+            events::stream_cancelled(&env, stream_id, &stream.sender, refund_amount, recipient_amount);
+            results.push_back(Ok(()));
         }
 
         Ok(results)
