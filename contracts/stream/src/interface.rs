@@ -148,6 +148,7 @@ pub trait SoroStreamInterface {
     fn withdraw(env: Env, stream_id: u64, recipient: Address) -> Result<(), StreamError>;
     fn cancel_stream(env: Env, stream_id: u64, sender: Address) -> Result<(), StreamError>;
     fn stop_stream(env: Env, stream_id: u64, caller: Address) -> Result<(), StreamError>;
+    fn transfer_sender(env: Env, stream_id: u64, current_sender: Address, new_sender: Address) -> Result<(), StreamError>;
     fn transfer_recipient(env: Env, stream_id: u64, current_recipient: Address, new_recipient: Address) -> Result<(), StreamError>;
     fn partial_cancel_stream(env: Env, stream_id: u64, sender: Address, cancel_amount: i128) -> Result<u64, StreamError>;
     fn top_up(env: Env, stream_id: u64, sender: Address, token: Address, amount: i128) -> Result<(), StreamError>;
@@ -202,6 +203,16 @@ pub trait SoroStreamInterface {
         non_transferable: bool,
     ) -> Result<Vec<u64>, StreamError>;
     fn get_nonce(env: Env, sender: Address) -> u64;
+    fn split_stream_with_schedules(
+        env: Env,
+        stream_id: u64,
+        sender: Address,
+        recipients: Vec<Address>,
+        amounts: Vec<i128>,
+        flow_rates: Vec<i128>,
+        end_times: Vec<u64>,
+        nonce: u64,
+    ) -> Result<Vec<u64>, StreamError>;
     fn batch_withdraw(env: Env, stream_ids: Vec<u64>, recipient: Address) -> Result<Vec<i128>, StreamError>;
     fn batch_cancel_stream(env: Env, stream_ids: Vec<u64>, sender: Address) -> Result<Vec<Result<(), StreamError>>, StreamError>;
 

@@ -113,6 +113,34 @@ pub fn remove_stream(env: &Env, stream_id: u64) {
     env.storage().persistent().remove(&stream_id);
 }
 
+/// Key for the monotonic event sequence number associated with a stream.
+pub fn stream_event_nonce_key(env: &Env, stream_id: u64) -> (Symbol, u64) {
+    (Symbol::new(env, "evn"), stream_id)
+}
+
+/// Reads the last emitted event nonce for a stream. Starts at 0 before any
+/// stream events are published for this ID.
+pub fn read_stream_event_nonce(env: &Env, stream_id: u64) -> u64 {
+    env.storage()
+        .persistent()
+        .get(&stream_event_nonce_key(env, stream_id))
+        .unwrap_or(0u64)
+}
+
+/// Increments the event nonce for a stream and returns the new value.
+///
+/// The first event for a stream gets nonce 1, which makes off-chain replay
+/// protection deterministic and unambiguous even when multiple withdrawals share
+/// the same `StreamWithdrawn` topic and stream_id.
+pub fn next_stream_event_nonce(env: &Env, stream_id: u64) -> u64 {
+    let key = stream_event_nonce_key(env, stream_id);
+    let next = read_stream_event_nonce(env, stream_id)
+        .checked_add(1)
+        .expect("stream event nonce overflow");
+    env.storage().persistent().set(&key, &next);
+    next
+}
+
 // --- Counter helpers (persistent, O(1) per write) ---
 
 pub fn sender_count_key(env: &Env, addr: &Address) -> (Symbol, Address) {
@@ -431,19 +459,35 @@ pub fn write_min_duration(env: &Env, duration: u64) {
         .set(&Symbol::new(env, MIN_DURATION_KEY), &duration);
 }
 
-/// Gets the maximum stream duration in seconds (0 = unlimited/no cap).
+/// Gets the maximum stream duration in seconds.
+///
+/// A value of 0 is treated as the protocol hard cap instead of “unlimited,” so
+/// stream end times cannot be effectively unbounded.
 pub fn read_max_duration(env: &Env) -> u64 {
-    env.storage()
+    let configured = env.storage()
         .instance()
         .get(&Symbol::new(env, MAX_DURATION_KEY))
-        .unwrap_or(0u64)
+        .unwrap_or(crate::MAX_STREAM_DURATION_SECONDS);
+    if configured == 0 {
+        crate::MAX_STREAM_DURATION_SECONDS
+    } else {
+        configured.min(crate::MAX_STREAM_DURATION_SECONDS)
+    }
 }
 
-/// Sets the maximum stream duration in seconds (0 = unlimited/no cap).
+/// Sets the maximum stream duration in seconds.
+///
+/// `0` and any value above the protocol hard cap are clamped back to the hard
+/// cap so a stream cannot live beyond the protocol's safe lifetime.
 pub fn write_max_duration(env: &Env, duration: u64) {
+    let capped = if duration == 0 || duration > crate::MAX_STREAM_DURATION_SECONDS {
+        crate::MAX_STREAM_DURATION_SECONDS
+    } else {
+        duration
+    };
     env.storage()
         .instance()
-        .set(&Symbol::new(env, MAX_DURATION_KEY), &duration);
+        .set(&Symbol::new(env, MAX_DURATION_KEY), &capped);
 }
 
 /// Gets the maximum allowed future start-time offset in seconds.
