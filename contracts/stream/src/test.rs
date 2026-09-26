@@ -60,6 +60,21 @@ fn test_create_stream_success() {
 }
 
 #[test]
+fn error_flow_rate_above_protocol_limit() {
+    let t = setup();
+    let c = client(&t);
+    let amount = 1_000_000_001i128;
+
+    let result = c.try_create_stream(
+        &t.sender, &t.recipient, &t.token_id, &amount, &1u64, &0u64, &0u64,
+        &false, &0u64, &false, &0i128, &None::<u32>, &None::<i128>, &None::<u32>,
+    );
+
+    assert_eq!(result, Err(Ok(StreamError::Overflow)));
+    assert_eq!(TokenClient::new(&t.env, &t.token_id).balance(&t.sender), 1_000_000);
+}
+
+#[test]
 fn test_withdrawal_cooldown_blocks_repeated_withdrawals() {
     let t = setup();
     let c = client(&t);
@@ -844,6 +859,25 @@ fn test_zero_duration_fails() {
     assert!(result.is_err());
 }
 
+#[test]
+fn test_zero_duration_rejected_by_scheduled_and_curve_streams() {
+    let t = setup();
+    let c = client(&t);
+
+    let curve_result = c.try_create_stream_with_curve(
+        &t.sender, &t.recipient, &t.token_id,
+        &100_000, &0, &0, &0u64, &false, &0u64, &false,
+        &VestingCurve::Linear,
+    );
+    assert_eq!(curve_result, Err(Ok(StreamError::InvalidDuration)));
+
+    let scheduled_result = c.try_create_stream_scheduled(
+        &t.sender, &t.recipient, &t.token_id,
+        &100_000, &0, &0u64, &0, &1u64, &false, &0u64, &false, &0i128,
+    );
+    assert_eq!(scheduled_result, Err(Ok(StreamError::InvalidDuration)));
+}
+
 // â”€â”€ Event snapshot tests (issue #105) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 //
 // These tests capture the exact event format emitted by each contract
@@ -947,6 +981,35 @@ fn snapshot_event_stream_withdrawn() {
     assert_eq!(data_tuple.0, t.recipient);
     assert_eq!(data_tuple.1, 50_000i128);     // 500s * 100 stroops/s
     assert_eq!(data_tuple.2, 500u64);
+}
+
+#[test]
+fn step_withdraw_same_ledger_does_not_emit_zero_amount_event() {
+    let t = setup();
+    let c = client(&t);
+    t.env.ledger().set_timestamp(0);
+
+    let tranches = soroban_sdk::Vec::from_array(&t.env, [
+        VestingTranche { unlock_time: 10, amount: 50_000i128 },
+        VestingTranche { unlock_time: 20, amount: 50_000i128 },
+    ]);
+    let stream_id = c.create_stream_with_schedule(
+        &t.sender, &t.recipient, &t.token_id, &100_000i128, &tranches,
+        &0u64, &0u64, &false, &None::<Address>, &0u32,
+    );
+
+    t.env.ledger().set_timestamp(10);
+    c.withdraw(&stream_id, &t.recipient);
+    c.withdraw(&stream_id, &t.recipient);
+
+    let withdraw_events: std::vec::Vec<_> = t.env.events().all().iter().filter(|(_, topics, _)| {
+        let topic_vec: soroban_sdk::Vec<Val> = topics.clone();
+        !topic_vec.is_empty()
+            && topic_vec.get(0).unwrap().into_val(&t.env)
+                == Symbol::new(&t.env, "StreamWithdrawn")
+    }).collect();
+
+    assert_eq!(withdraw_events.len(), 1);
 }
 
 #[test]
@@ -1409,6 +1472,34 @@ fn error_stream_not_active_on_top_up_expired() {
 }
 
 #[test]
+fn error_stream_not_active_on_top_up_cancelled_by_partial_cancel() {
+    let t = setup();
+    let c = client(&t);
+    t.env.ledger().set_timestamp(0);
+
+    let stream_id = c.create_stream(
+        &t.sender, &t.recipient, &t.token_id, &100_000, &1000, &0, &0u64, &false, &0u64,
+        &false,
+        &0i128,
+        &None::<u32>,
+        &None::<i128>,
+        &None::<u32>,
+    );
+    let token = TokenClient::new(&t.env, &t.token_id);
+
+    c.partial_cancel_stream(&stream_id, &t.sender, &10_000);
+    assert_eq!(c.get_stream(&stream_id).status, StreamStatus::Cancelled);
+
+    let sender_balance = token.balance(&t.sender);
+    let contract_balance = token.balance(&t.contract_id);
+    let result = c.try_top_up(&stream_id, &t.sender, &t.token_id, &10_000);
+
+    assert_eq!(result, Err(Ok(StreamError::StreamNotActive)));
+    assert_eq!(token.balance(&t.sender), sender_balance);
+    assert_eq!(token.balance(&t.contract_id), contract_balance);
+}
+
+#[test]
 fn success_top_up_paused_stream() {
     let t = setup();
     let c = client(&t);
@@ -1429,11 +1520,26 @@ fn success_top_up_paused_stream() {
     // Topping up a paused stream should succeed
     let result = c.try_top_up(&stream_id, &t.sender, &t.token_id, &10_000);
     assert!(result.is_ok());
-
     // Verify the stream's deposit was increased
     let stream = c.get_stream(&stream_id);
     assert_eq!(stream.deposit, 100_000 + 10_000);
     assert_eq!(stream.status, StreamStatus::Paused);
+}
+
+#[test]
+fn protocol_fee_change_requires_timelock() {
+    let t = setup();
+    let c = client(&t);
+    let admin = Address::generate(&t.env);
+    c.initialize(&admin, &soroban_sdk::String::from_str(&t.env, "1.0.0"));
+
+    c.set_protocol_fee(&10_000u32);
+    assert_eq!(c.get_protocol_fee_info().0, 0);
+    assert_eq!(c.try_execute_fee_change(), Err(Ok(StreamError::StreamLocked)));
+
+    t.env.ledger().set_timestamp(7 * 24 * 60 * 60);
+    c.execute_fee_change();
+    assert_eq!(c.get_protocol_fee_info().0, 10_000);
 }
 
 #[test]
@@ -5686,6 +5792,64 @@ fn test_zero_duration_stream_rejected() {
     match result {
         Err(e) => assert_eq!(e, StreamError::StreamDurationTooShort),
         Ok(_) => panic!("Expected StreamDurationTooShort error"),
+    }
+}
+
+#[test]
+fn test_pause_resume_requires_sender_identity() {
+    let t = setup();
+    let c = client(&t);
+
+    let stream_id = c.create_stream(
+        &t.sender, &t.recipient, &t.token_id,
+        &100_000i128, &1000u64, &0u64, &0u64,
+        &false, &0u64, &false, &0i128,
+        &None::<u32>, &None::<i128>, &false, &false,
+    );
+
+    let pause_result = c.try_pause_stream(&stream_id, &t.recipient);
+    assert!(pause_result.is_err(), "recipient should not be able to pause another user's stream");
+    match pause_result {
+        Err(e) => assert_eq!(e, StreamError::NotSender),
+        Ok(_) => panic!("Expected NotSender error for pause_stream"),
+    }
+
+    c.pause_stream(&stream_id, &t.sender);
+    let resume_result = c.try_resume_stream(&stream_id, &t.recipient);
+    assert!(resume_result.is_err(), "recipient should not be able to resume another user's stream");
+    match resume_result {
+        Err(e) => assert_eq!(e, StreamError::NotSender),
+        Ok(_) => panic!("Expected NotSender error for resume_stream"),
+    }
+}
+
+#[test]
+fn test_max_duration_defaults_to_hard_cap() {
+    let t = setup();
+    let c = client(&t);
+
+    assert_eq!(c.max_duration(), 100 * 365 * 24 * 60 * 60, "default max duration must be the protocol hard cap");
+}
+
+#[test]
+fn test_max_duration_clamps_and_rejects_overlong_streams() {
+    let t = setup();
+    let c = client(&t);
+
+    let hard_cap = 100 * 365 * 24 * 60 * 60;
+    c.set_max_duration(&t.sender, &(hard_cap + 1));
+    assert_eq!(c.max_duration(), hard_cap, "admin-set value above the hard cap must be clamped");
+
+    let result = c.try_create_stream(
+        &t.sender, &t.recipient, &t.token_id,
+        &100_000i128, &(hard_cap + 1), &0u64, &0u64,
+        &false, &0u64, &false, &0i128,
+        &None::<u32>, &None::<i128>, &false, &false,
+    );
+    assert!(result.is_err(), "streams above the hard cap must be rejected");
+    match result {
+        Err(e) => assert_eq!(e, StreamError::DurationExceedsMax),
+        Ok(_) => panic!("Expected DurationExceedsMax error"),
     }
 }
 
