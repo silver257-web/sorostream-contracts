@@ -96,7 +96,7 @@ fn checked_flow_amount(flow_rate: i128, elapsed: u64) -> Result<i128, StreamErro
     flow_rate.checked_mul(elapsed as i128).ok_or(StreamError::Overflow)
 }
 
-const MAX_STREAM_DURATION_SECONDS: u64 = 100 * 365 * 24 * 60 * 60;
+pub(crate) const MAX_STREAM_DURATION_SECONDS: u64 = 100 * 365 * 24 * 60 * 60;
 
 /// Maximum safe flow_rate that won't overflow when multiplied by any valid duration.
 /// Calculated as i128::MAX / MAX_STREAM_DURATION_SECONDS.
@@ -1256,12 +1256,18 @@ impl SoroStreamContract {
         write_min_duration(&env, seconds);
     }
 
-    /// Returns the maximum allowed stream duration in seconds (0 = unlimited).
+    /// Returns the hard maximum allowed stream duration in seconds.
+    ///
+    /// Defaults to the protocol cap and never exceeds it.
     pub fn max_duration(env: Env) -> u64 {
         read_max_duration(&env)
     }
 
-    /// Sets the maximum allowed stream duration in seconds. Setting to 0 disables the cap. Only the admin may call this.
+    /// Sets the maximum allowed stream duration in seconds.
+    ///
+    /// Values above the protocol hard cap are clamped back to that cap. A value of
+    /// 0 resets the setting to the protocol hard cap rather than creating an
+    /// indefinite stream lifetime.
     pub fn set_max_duration(env: Env, admin: Address, seconds: u64) {
         admin.require_auth();
         write_max_duration(&env, seconds);

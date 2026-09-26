@@ -5624,6 +5624,64 @@ fn test_zero_duration_stream_rejected() {
     }
 }
 
+#[test]
+fn test_pause_resume_requires_sender_identity() {
+    let t = setup();
+    let c = client(&t);
+
+    let stream_id = c.create_stream(
+        &t.sender, &t.recipient, &t.token_id,
+        &100_000i128, &1000u64, &0u64, &0u64,
+        &false, &0u64, &false, &0i128,
+        &None::<u32>, &None::<i128>, &false, &false,
+    );
+
+    let pause_result = c.try_pause_stream(&stream_id, &t.recipient);
+    assert!(pause_result.is_err(), "recipient should not be able to pause another user's stream");
+    match pause_result {
+        Err(e) => assert_eq!(e, StreamError::NotSender),
+        Ok(_) => panic!("Expected NotSender error for pause_stream"),
+    }
+
+    c.pause_stream(&stream_id, &t.sender);
+    let resume_result = c.try_resume_stream(&stream_id, &t.recipient);
+    assert!(resume_result.is_err(), "recipient should not be able to resume another user's stream");
+    match resume_result {
+        Err(e) => assert_eq!(e, StreamError::NotSender),
+        Ok(_) => panic!("Expected NotSender error for resume_stream"),
+    }
+}
+
+#[test]
+fn test_max_duration_defaults_to_hard_cap() {
+    let t = setup();
+    let c = client(&t);
+
+    assert_eq!(c.max_duration(), 100 * 365 * 24 * 60 * 60, "default max duration must be the protocol hard cap");
+}
+
+#[test]
+fn test_max_duration_clamps_and_rejects_overlong_streams() {
+    let t = setup();
+    let c = client(&t);
+
+    let hard_cap = 100 * 365 * 24 * 60 * 60;
+    c.set_max_duration(&t.sender, &(hard_cap + 1));
+    assert_eq!(c.max_duration(), hard_cap, "admin-set value above the hard cap must be clamped");
+
+    let result = c.try_create_stream(
+        &t.sender, &t.recipient, &t.token_id,
+        &100_000i128, &(hard_cap + 1), &0u64, &0u64,
+        &false, &0u64, &false, &0i128,
+        &None::<u32>, &None::<i128>, &false, &false,
+    );
+    assert!(result.is_err(), "streams above the hard cap must be rejected");
+    match result {
+        Err(e) => assert_eq!(e, StreamError::DurationExceedsMax),
+        Ok(_) => panic!("Expected DurationExceedsMax error"),
+    }
+}
+
 /// Test that min_duration is properly applied across different stream types.
 #[test]
 fn test_min_duration_enforced_all_stream_types() {
