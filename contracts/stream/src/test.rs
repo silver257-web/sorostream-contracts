@@ -1523,11 +1523,26 @@ fn success_top_up_paused_stream() {
     // Topping up a paused stream should succeed
     let result = c.try_top_up(&stream_id, &t.sender, &t.token_id, &10_000);
     assert!(result.is_ok());
-
     // Verify the stream's deposit was increased
     let stream = c.get_stream(&stream_id);
     assert_eq!(stream.deposit, 100_000 + 10_000);
     assert_eq!(stream.status, StreamStatus::Paused);
+}
+
+#[test]
+fn protocol_fee_change_requires_timelock() {
+    let t = setup();
+    let c = client(&t);
+    let admin = Address::generate(&t.env);
+    c.initialize(&admin, &soroban_sdk::String::from_str(&t.env, "1.0.0"));
+
+    c.set_protocol_fee(&10_000u32);
+    assert_eq!(c.get_protocol_fee_info().0, 0);
+    assert_eq!(c.try_execute_fee_change(), Err(Ok(StreamError::StreamLocked)));
+
+    t.env.ledger().set_timestamp(7 * 24 * 60 * 60);
+    c.execute_fee_change();
+    assert_eq!(c.get_protocol_fee_info().0, 10_000);
 }
 
 #[test]

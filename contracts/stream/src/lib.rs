@@ -35,6 +35,9 @@ use soroban_sdk::{
 };
 use types::VestingTranche;
 use types::{Milestone, MilestoneStatus};
+
+const PROTOCOL_FEE_CHANGE_DELAY: u64 = 7 * 24 * 60 * 60;
+
 use storage::{
     accumulate_fees, add_fee_exempt, add_to_blocklist,
     append_audit_entry, check_admin, cleanup_dual_stream_storage,
@@ -57,7 +60,7 @@ use storage::{
     index_by_recipient, index_by_sender, index_by_tag, index_global_stream,
     is_blocked, is_fee_exempt, is_paused_or_auto_unpause, is_recipient_allowed,
     is_rate_limit_exempt, is_reentrancy_locked, is_sender_promoted,
-    is_token_whitelisted, is_token_whitelist_enabled, is_whitelisted,
+    is_token_whitelisted, is_whitelisted,
     is_whitelist_enabled, load_stream, load_tranches,
     add_token_to_whitelist, set_token_whitelist_enabled,
     mark_nonce_used, MAX_PAUSE_DURATION, nonce_used,
@@ -175,7 +178,9 @@ fn check_rate_limit(env: &Env, sender: &Address) -> Result<(), StreamError> {
 // ── Helper: token whitelist ───────────────────────────────────────────────────
 #[allow(dead_code)]
 fn check_token_whitelist(env: &Env, token: &Address) -> Result<(), StreamError> {
-    if is_token_whitelist_enabled(env) && !is_token_whitelisted(env, token) {
+    // Token contracts are an untrusted external-call boundary. A token must
+    // be explicitly approved by the admin before any transfer is attempted.
+    if !is_token_whitelisted(env, token) {
         return Err(StreamError::TokenNotWhitelisted);
     }
     Ok(())
@@ -201,7 +206,8 @@ fn check_sender_stake(env: &Env, sender: &Address, token: &Address) -> Result<()
 
 // ── Helper: validate SAC address ─────────────────────────────────────────────
 fn validate_token_address(env: &Env, token: &Address) -> Result<(), StreamError> {
-    // `symbol()` panics if `token` is not a valid SAC; success is sufficient validation.
+    // The allowlist is the trust boundary; this call only verifies the approved
+    // contract exposes the expected token interface before stream creation.
     let _ = token::Client::new(env, token).symbol();
     Ok(())
 }
@@ -209,6 +215,13 @@ fn validate_token_address(env: &Env, token: &Address) -> Result<(), StreamError>
 fn validate_recipient_address(env: &Env, sender: &Address, recipient: &Address) -> Result<(), StreamError> {
     if recipient == sender || recipient == &env.current_contract_address() {
         return Err(StreamError::NotRecipient);
+    }
+    Ok(())
+}
+
+fn reject_reentrant_call(env: &Env) -> Result<(), StreamError> {
+    if is_reentrancy_locked(env) {
+        return Err(StreamError::ReentrancyDetected);
     }
     Ok(())
 }
@@ -686,6 +699,8 @@ impl SoroStreamContract {
         auto_renew: bool,
         params: crate::types::CreateStreamParams,
     ) -> Result<u64, StreamError> {
+        reject_reentrant_call(&env)?;
+        set_reentrancy_lock(&env);
         let nonce = params.nonce;
         let cliff_seconds = params.cliff_seconds;
         let lock_until = params.lock_until;
@@ -886,6 +901,7 @@ impl SoroStreamContract {
             &env.current_contract_address(),
             &amount,
         );
+        clear_reentrancy_lock(&env);
 
         let stream = Stream {
             id: stream_id,
@@ -1044,6 +1060,8 @@ impl SoroStreamContract {
         auto_renew: bool,
         renew_count: Option<u32>,
     ) -> Result<u64, StreamError> {
+        reject_reentrant_call(&env)?;
+        set_reentrancy_lock(&env);
         sender.require_auth();
         let lock_until = start_time;
         let allow_recipient_termination = false;
@@ -1182,6 +1200,7 @@ impl SoroStreamContract {
             &env.current_contract_address(),
             &amount,
         );
+        clear_reentrancy_lock(&env);
 
         let stream = Stream {
             id: stream_id,
@@ -1322,6 +1341,8 @@ impl SoroStreamContract {
         oracle: Option<Address>,
         max_price_deviation_bps: u32,
     ) -> Result<u64, StreamError> {
+        reject_reentrant_call(&env)?;
+        set_reentrancy_lock(&env);
         sender.require_auth();
 
         if is_paused_or_auto_unpause(&env) {
@@ -1441,6 +1462,7 @@ impl SoroStreamContract {
             &env.current_contract_address(),
             &deposit,
         );
+        clear_reentrancy_lock(&env);
 
         let tranche_count = tranches.len();
 
@@ -1540,6 +1562,8 @@ impl SoroStreamContract {
         on_complete_function: Option<Symbol>,
         escrow_hold: bool,
     ) -> Result<u64, StreamError> {
+        reject_reentrant_call(&env)?;
+        set_reentrancy_lock(&env);
         sender.require_auth();
 
         if is_paused_or_auto_unpause(&env) {
@@ -1640,6 +1664,7 @@ impl SoroStreamContract {
             &env.current_contract_address(),
             &amount,
         );
+        clear_reentrancy_lock(&env);
 
         let stream = Stream {
             id: stream_id,
@@ -1728,6 +1753,8 @@ impl SoroStreamContract {
         lock_until: u64,
         allow_recipient_termination: bool,
     ) -> Result<u64, StreamError> {
+        reject_reentrant_call(&env)?;
+        set_reentrancy_lock(&env);
         sender.require_auth();
 
         if is_paused_or_auto_unpause(&env) {
@@ -1820,6 +1847,7 @@ impl SoroStreamContract {
             &env.current_contract_address(),
             &deposit,
         );
+        clear_reentrancy_lock(&env);
 
         // Build milestones vector
         let mut milestones = Vec::new(&env);
@@ -2104,6 +2132,7 @@ impl SoroStreamContract {
     /// On withdraw, claimable tokens will be topped up into the target stream
     /// instead of sent directly to the recipient.
     pub fn set_redirect(env: Env, stream_id: u64, target_stream_id: u64, recipient: Address) -> Result<(), StreamError> {
+        reject_reentrant_call(&env)?;
         recipient.require_auth();
         let mut stream = load_stream(&env, stream_id).ok_or(StreamError::StreamNotFound)?;
         if stream.recipient != recipient { return Err(StreamError::NotRecipient); }
@@ -2118,6 +2147,7 @@ impl SoroStreamContract {
 
     /// Clears the redirect target on a stream. Only the recipient may call this.
     pub fn clear_redirect(env: Env, stream_id: u64, recipient: Address) -> Result<(), StreamError> {
+        reject_reentrant_call(&env)?;
         recipient.require_auth();
         let mut stream = load_stream(&env, stream_id).ok_or(StreamError::StreamNotFound)?;
         if stream.recipient != recipient { return Err(StreamError::NotRecipient); }
@@ -2131,18 +2161,22 @@ impl SoroStreamContract {
         load_stream(&env, stream_id).and_then(|s| s.options.redirect_to_stream_id)
     }
 
-    /// Enables or disables the token whitelist enforcement (Issue #221).
-    /// When enabled, only whitelisted tokens can be used in streams.
+    /// Enables token whitelist enforcement (Issue #221).
+    ///
+    /// The allowlist is mandatory because token transfers are external calls.
+    /// Disabling enforcement is rejected.
     pub fn set_token_whitelist_enabled(env: Env, admin: Address, enabled: bool) -> Result<(), StreamError> {
         check_admin(&env);
         admin.require_auth();
+        if !enabled {
+            return Err(StreamError::NotAuthorized);
+        }
         set_token_whitelist_enabled(&env, enabled);
         events::token_whitelist_toggled(&env, enabled);
         Ok(())
     }
 
-    /// Adds a token to the whitelist (Issue #221).
-    /// When token whitelisting is enabled, only tokens in the whitelist can be streamed.
+    /// Adds a token to the mandatory whitelist (Issue #221).
     pub fn add_token_to_whitelist(env: Env, admin: Address, token: Address) -> Result<(), StreamError> {
         check_admin(&env);
         admin.require_auth();
@@ -2239,6 +2273,7 @@ impl SoroStreamContract {
     /// The stream must be past its `end_time` and the grace period (in ledgers)
     /// must have passed since `end_time`. After recovery the stream is removed.
     pub fn recover_expired(env: Env, stream_id: u64, sender: Address) -> Result<(), StreamError> {
+        reject_reentrant_call(&env)?;
         sender.require_auth();
 
         let stream = load_stream(&env, stream_id).ok_or(StreamError::StreamNotFound)?;
@@ -2325,6 +2360,7 @@ impl SoroStreamContract {
 
     /// Sweeps expired, fully-withdrawn streams from storage and refunds rent incentive.
     pub fn sweep_expired(env: Env, stream_ids: Vec<u64>) -> Result<(), StreamError> {
+        reject_reentrant_call(&env)?;
         let now = env.ledger().timestamp();
 
         for stream_id in stream_ids.iter() {
@@ -2356,6 +2392,7 @@ impl SoroStreamContract {
         milestone_index: u32,
         sender: Address,
     ) -> Result<(), StreamError> {
+        reject_reentrant_call(&env)?;
         sender.require_auth();
 
         let mut stream = load_stream(&env, stream_id).ok_or(StreamError::StreamNotFound)?;
@@ -2387,6 +2424,7 @@ impl SoroStreamContract {
     ///
     /// Emits `TtlBumped { stream_id, new_expiry_ledger }`.
     pub fn bump_stream_ttl(env: Env, stream_id: u64) -> Result<(), StreamError> {
+        reject_reentrant_call(&env)?;
         let stream = load_stream(&env, stream_id).ok_or(StreamError::StreamNotFound)?;
 
         if stream.status != StreamStatus::Active && stream.status != StreamStatus::Paused {
@@ -2503,6 +2541,7 @@ impl SoroStreamContract {
     /// Follows checks-effects-interactions: all state is updated before any token
     /// transfer. A reentrancy guard blocks re-entrant calls during settlement.
     pub fn withdraw(env: Env, stream_id: u64, recipient: Address) -> Result<(), StreamError> {
+        reject_reentrant_call(&env)?;
         if is_paused_or_auto_unpause(&env) {
             return Err(StreamError::ContractPaused);
         }
@@ -3934,6 +3973,7 @@ impl SoroStreamContract {
         current_recipient: Address,
         new_recipient: Address,
     ) -> Result<(), StreamError> {
+        reject_reentrant_call(&env)?;
         if is_paused_or_auto_unpause(&env) {
             return Err(StreamError::ContractPaused);
         }
@@ -4029,6 +4069,7 @@ impl SoroStreamContract {
         stream_id: u64,
         recipient: Address,
     ) -> Result<(), StreamError> {
+        reject_reentrant_call(&env)?;
         if is_paused_or_auto_unpause(&env) {
             return Err(StreamError::ContractPaused);
         }
@@ -4110,6 +4151,7 @@ impl SoroStreamContract {
         caller: Address,
         cancel_amount: i128,
     ) -> Result<u64, StreamError> {
+        reject_reentrant_call(&env)?;
         caller.require_auth();
 
         let mut stream = load_stream(&env, stream_id).ok_or(StreamError::StreamNotFound)?;
@@ -4245,6 +4287,7 @@ impl SoroStreamContract {
         token: Address,
         amount: i128,
     ) -> Result<(), StreamError> {
+        reject_reentrant_call(&env)?;
         if is_paused_or_auto_unpause(&env) {
             return Err(StreamError::ContractPaused);
         }
@@ -4457,6 +4500,7 @@ impl SoroStreamContract {
     /// - `ZeroAmount` — stream has no holdback configured.
     /// - `StreamNotActive` — holdback already settled.
     pub fn release_holdback(env: Env, stream_id: u64, caller: Address) -> Result<(), StreamError> {
+        reject_reentrant_call(&env)?;
         caller.require_auth();
 
         let mut stream = load_stream(&env, stream_id).ok_or(StreamError::StreamNotFound)?;
@@ -4559,6 +4603,7 @@ impl SoroStreamContract {
     /// `end_time` must have passed. Cancelled streams are never transitioned to
     /// Expired. Emits `StreamExpired { stream_id }`.
     pub fn mark_expired(env: Env, stream_id: u64) -> Result<(), StreamError> {
+        reject_reentrant_call(&env)?;
         let mut stream = load_stream(&env, stream_id).ok_or(StreamError::StreamNotFound)?;
 
         // Only Active or Completed streams can be marked Expired.
@@ -4988,6 +5033,7 @@ impl SoroStreamContract {
 
     /// Pauses an active stream.
     pub fn pause_stream(env: Env, stream_id: u64, sender: Address) -> Result<(), StreamError> {
+        reject_reentrant_call(&env)?;
         if is_paused_or_auto_unpause(&env) {
             return Err(StreamError::ContractPaused);
         }
@@ -5012,6 +5058,7 @@ impl SoroStreamContract {
 
     /// Resumes a paused stream, pushing back the end time.
     pub fn resume_stream(env: Env, stream_id: u64, sender: Address) -> Result<(), StreamError> {
+        reject_reentrant_call(&env)?;
         if is_paused_or_auto_unpause(&env) {
             return Err(StreamError::ContractPaused);
         }
@@ -5057,6 +5104,7 @@ impl SoroStreamContract {
         nonce: u64,
         non_transferable: bool,
     ) -> Result<Vec<u64>, StreamError> {
+        reject_reentrant_call(&env)?;
         if is_paused_or_auto_unpause(&env) {
             return Err(StreamError::ContractPaused);
         }
@@ -5250,6 +5298,8 @@ impl SoroStreamContract {
             stream_ids.push_back(stream_id);
         }
 
+        clear_reentrancy_lock(&env);
+
         // ── Phase 3: Index all streams only after all transfers succeed ───────
         //
         // Sender/recipient/global indexes are updated in a dedicated pass that
@@ -5286,6 +5336,9 @@ impl SoroStreamContract {
         if is_paused_or_auto_unpause(&env) {
             return Err(StreamError::ContractPaused);
         }
+        if stream_ids.is_empty() || stream_ids.len() > 20 {
+            return Err(StreamError::BatchLengthMismatch);
+        }
         recipient.require_auth();
 
         let mut amounts = Vec::new(&env);
@@ -5296,8 +5349,15 @@ impl SoroStreamContract {
             if stream.recipient != recipient {
                 return Err(StreamError::NotRecipient);
             }
+            if stream.status == StreamStatus::PendingApproval || stream.status == StreamStatus::EscrowHold {
+                return Err(StreamError::AwaitingApproval);
+            }
             if stream.status != StreamStatus::Active {
                 return Err(StreamError::StreamNotActive);
+            }
+
+            if stream.options.locked {
+                return Err(StreamError::ReentrancyDetected);
             }
 
             let now = env.ledger().timestamp();
@@ -5320,7 +5380,7 @@ impl SoroStreamContract {
             }
 
             let (recipient_amount, fee_amount) = if claimable > 0 {
-                let fee_bps = get_protocol_fee(&env);
+                let fee_bps = storage::get_effective_fee_tier(&env, &stream.token);
                 let fee_amount = if fee_bps > 0 && !is_fee_exempt(&env, &stream.recipient) {
                     claimable
                         .checked_mul(fee_bps as i128)
@@ -5535,12 +5595,21 @@ impl SoroStreamContract {
         Ok(results)
     }
 
-    /// Sets the protocol fee in basis points (100 bps = 1%).
+    /// Proposes a protocol fee change in basis points (100 bps = 1%).
+    ///
+    /// The fee remains unchanged until the seven-day timelock expires and
+    /// `execute_fee_change` is called.
     pub fn set_protocol_fee(env: Env, fee_bps: u32) -> Result<(), StreamError> {
+        let admin = read_admin(&env).ok_or(StreamError::NotInitialized)?;
+        admin.require_auth();
         if fee_bps > 10_000 {
             return Err(StreamError::InvalidDuration);
         }
-        set_protocol_fee(&env, fee_bps);
+
+        let now = env.ledger().timestamp();
+        let unlock_time = now.saturating_add(PROTOCOL_FEE_CHANGE_DELAY);
+        write_pending_fee_proposal(&env, fee_bps, unlock_time);
+        events::fee_change_proposed(&env, fee_bps, unlock_time);
         Ok(())
     }
 
@@ -5775,7 +5844,7 @@ impl SoroStreamContract {
         }
 
         let now = env.ledger().timestamp();
-        let unlock_time = now.saturating_add(7 * 24 * 60 * 60);
+        let unlock_time = now.saturating_add(PROTOCOL_FEE_CHANGE_DELAY);
 
         write_pending_fee_proposal(&env, new_fee_bps, unlock_time);
         events::fee_change_proposed(&env, new_fee_bps, unlock_time);
