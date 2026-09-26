@@ -859,6 +859,25 @@ fn test_zero_duration_fails() {
     assert!(result.is_err());
 }
 
+#[test]
+fn test_zero_duration_rejected_by_scheduled_and_curve_streams() {
+    let t = setup();
+    let c = client(&t);
+
+    let curve_result = c.try_create_stream_with_curve(
+        &t.sender, &t.recipient, &t.token_id,
+        &100_000, &0, &0, &0u64, &false, &0u64, &false,
+        &VestingCurve::Linear,
+    );
+    assert_eq!(curve_result, Err(Ok(StreamError::InvalidDuration)));
+
+    let scheduled_result = c.try_create_stream_scheduled(
+        &t.sender, &t.recipient, &t.token_id,
+        &100_000, &0, &0u64, &0, &1u64, &false, &0u64, &false, &0i128,
+    );
+    assert_eq!(scheduled_result, Err(Ok(StreamError::InvalidDuration)));
+}
+
 // â”€â”€ Event snapshot tests (issue #105) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 //
 // These tests capture the exact event format emitted by each contract
@@ -962,6 +981,35 @@ fn snapshot_event_stream_withdrawn() {
     assert_eq!(data_tuple.0, t.recipient);
     assert_eq!(data_tuple.1, 50_000i128);     // 500s * 100 stroops/s
     assert_eq!(data_tuple.2, 500u64);
+}
+
+#[test]
+fn step_withdraw_same_ledger_does_not_emit_zero_amount_event() {
+    let t = setup();
+    let c = client(&t);
+    t.env.ledger().set_timestamp(0);
+
+    let tranches = soroban_sdk::Vec::from_array(&t.env, [
+        VestingTranche { unlock_time: 10, amount: 50_000i128 },
+        VestingTranche { unlock_time: 20, amount: 50_000i128 },
+    ]);
+    let stream_id = c.create_stream_with_schedule(
+        &t.sender, &t.recipient, &t.token_id, &100_000i128, &tranches,
+        &0u64, &0u64, &false, &None::<Address>, &0u32,
+    );
+
+    t.env.ledger().set_timestamp(10);
+    c.withdraw(&stream_id, &t.recipient);
+    c.withdraw(&stream_id, &t.recipient);
+
+    let withdraw_events: std::vec::Vec<_> = t.env.events().all().iter().filter(|(_, topics, _)| {
+        let topic_vec: soroban_sdk::Vec<Val> = topics.clone();
+        !topic_vec.is_empty()
+            && topic_vec.get(0).unwrap().into_val(&t.env)
+                == Symbol::new(&t.env, "StreamWithdrawn")
+    }).collect();
+
+    assert_eq!(withdraw_events.len(), 1);
 }
 
 #[test]
@@ -1424,6 +1472,34 @@ fn error_stream_not_active_on_top_up_expired() {
     // Attempt to top up the expired stream should fail with StreamNotActive
     let result = c.try_top_up(&stream_id, &t.sender, &t.token_id, &10_000);
     assert_eq!(result, Err(Ok(StreamError::StreamNotActive)));
+}
+
+#[test]
+fn error_stream_not_active_on_top_up_cancelled_by_partial_cancel() {
+    let t = setup();
+    let c = client(&t);
+    t.env.ledger().set_timestamp(0);
+
+    let stream_id = c.create_stream(
+        &t.sender, &t.recipient, &t.token_id, &100_000, &1000, &0, &0u64, &false, &0u64,
+        &false,
+        &0i128,
+        &None::<u32>,
+        &None::<i128>,
+        &None::<u32>,
+    );
+    let token = TokenClient::new(&t.env, &t.token_id);
+
+    c.partial_cancel_stream(&stream_id, &t.sender, &10_000);
+    assert_eq!(c.get_stream(&stream_id).status, StreamStatus::Cancelled);
+
+    let sender_balance = token.balance(&t.sender);
+    let contract_balance = token.balance(&t.contract_id);
+    let result = c.try_top_up(&stream_id, &t.sender, &t.token_id, &10_000);
+
+    assert_eq!(result, Err(Ok(StreamError::StreamNotActive)));
+    assert_eq!(token.balance(&t.sender), sender_balance);
+    assert_eq!(token.balance(&t.contract_id), contract_balance);
 }
 
 #[test]
