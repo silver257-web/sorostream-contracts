@@ -103,6 +103,9 @@ const MAX_STREAM_DURATION_SECONDS: u64 = 100 * 365 * 24 * 60 * 60;
 /// This ensures that flow_rate * elapsed can never overflow i128 for any valid stream.
 const MAX_SAFE_FLOW_RATE: i128 = i128::MAX / (MAX_STREAM_DURATION_SECONDS as i128);
 
+/// Maximum operational flow rate supported by the protocol.
+const MAX_FLOW_RATE: i128 = 1_000_000_000;
+
 /// Validates that a flow_rate is within safe bounds for arithmetic operations.
 /// Returns error if flow_rate could overflow when multiplied by any elapsed time
 /// within a valid stream duration.
@@ -111,6 +114,9 @@ fn validate_flow_rate_bounds(flow_rate: i128) -> Result<(), StreamError> {
         return Err(StreamError::ZeroFlowRate);
     }
     if flow_rate > MAX_SAFE_FLOW_RATE {
+        return Err(StreamError::Overflow);
+    }
+    if flow_rate > MAX_FLOW_RATE {
         return Err(StreamError::Overflow);
     }
     Ok(())
@@ -1101,6 +1107,7 @@ impl SoroStreamContract {
         if flow_rate == 0 {
             return Err(StreamError::ZeroFlowRate);
         }
+        validate_flow_rate_bounds(flow_rate)?;
 
         let sender_count = get_sender_stream_count(&env, &sender);
         let limit = effective_sender_limit(&env, &sender);
@@ -1557,6 +1564,7 @@ impl SoroStreamContract {
         if flow_rate == 0 {
             return Err(StreamError::ZeroFlowRate);
         }
+        validate_flow_rate_bounds(flow_rate)?;
 
         let sender_count = get_sender_stream_count(&env, &sender);
         let limit = effective_sender_limit(&env, &sender);

@@ -60,6 +60,21 @@ fn test_create_stream_success() {
 }
 
 #[test]
+fn error_flow_rate_above_protocol_limit() {
+    let t = setup();
+    let c = client(&t);
+    let amount = 1_000_000_001i128;
+
+    let result = c.try_create_stream(
+        &t.sender, &t.recipient, &t.token_id, &amount, &1u64, &0u64, &0u64,
+        &false, &0u64, &false, &0i128, &None::<u32>, &None::<i128>, &None::<u32>,
+    );
+
+    assert_eq!(result, Err(Ok(StreamError::Overflow)));
+    assert_eq!(TokenClient::new(&t.env, &t.token_id).balance(&t.sender), 1_000_000);
+}
+
+#[test]
 fn test_withdrawal_cooldown_blocks_repeated_withdrawals() {
     let t = setup();
     let c = client(&t);
